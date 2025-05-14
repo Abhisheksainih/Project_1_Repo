@@ -6,6 +6,7 @@ from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator
 from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
 from airflow.utils.trigger_rule import TriggerRule
 from airflow.utils.task_group import TaskGroup
+from airflow.operators.python import get_current_context
 from datetime import datetime
 import time
 import pytz
@@ -15,9 +16,16 @@ def get_current_ist_timestamp():
     utc_now = datetime.now(pytz.utc)
     ist_timezone = pytz.timezone('Asia/Kolkata')
     return utc_now.astimezone(ist_timezone).strftime("%Y_%m_%d_%H%M%S")
+# def map_me(x, **context):
+#     print(x)
+
+#     from airflow.operators.python import get_current_context
+
+#     context = get_current_context()
+#     context["my_custom_template"] = f"{x}"
 
 with DAG(
-    dag_id='Automated_with_glue',
+    dag_id='Automated_with_glue_v2',
     start_date=datetime(2023, 1, 1),
     schedule_interval=None,
     catchup=False,
@@ -39,7 +47,7 @@ with DAG(
         """Fetch data from Snowflake, returns list of records or empty list"""
         hook = SnowflakeHook(snowflake_conn_id='snowflake_conn')
         sql = """
-        SELECT ID, TARGET_TABLE_NAME, TARGET_TABLE_ROW_COUNT, S3_STAGE  
+        SELECT ID, TARGET_TABLE_NAME, TARGET_TABLE_ROW_COUNT, S3_STAGE  , EXTRACT_ID
         FROM BCI_POC.EXTRACT_FRAMEWORK.SENSOR_TABLE;
         """
         df = hook.get_pandas_df(sql)
@@ -51,15 +59,20 @@ with DAG(
         if not sensor_data:  # Empty list check
             return "finish_empty"
         return "process_data_group.generate_copy_commands"
+    
 
 
-    @task
-    def generate_copy_commands(sensor_row ):
+    @task(map_index_template="Generating Copy command for {{my_custom_template}}")
+    def generate_copy_commands(sensor_row , **context):
         timestamp = get_current_ist_timestamp()
         id_val = sensor_row['ID']
         source_table_name = sensor_row['TARGET_TABLE_NAME']
         temp_table_path = f"{source_table_name}_{timestamp}"
         manifest_table = 'SENSOR_TABLE'
+        context = get_current_context()
+        context["my_custom_template"] = f"{source_table_name} | Extract id : {sensor_row['EXTRACT_ID']}"
+
+
         
         s3_stage = "@my_s3_stage"
         s3_path = f"{s3_stage}/{temp_table_path}/data.gz"
@@ -91,11 +104,14 @@ with DAG(
             'execution_time': timestamp
         }
 
-    @task
-    def execute_commands_unloading(payload):
+    @task(map_index_template="Unloading of {{ my_custom_template }}")
+    def execute_commands_unloading(payload , **context):
         """Execute the generated SQL commands"""
         commands = payload['commands']
         sensor_row = payload['sensor_row']
+        source_table_name = sensor_row['TARGET_TABLE_NAME']
+        context = get_current_context()
+        context["my_custom_template"] = f" {source_table_name} | Extract id : {sensor_row['EXTRACT_ID']} "
         
         SnowflakeOperator(
             task_id=f"copy_header_{sensor_row['ID']}",
@@ -134,14 +150,17 @@ with DAG(
 
 
         
-    @task
-    def run_glue_dispatcher(payload):
+    @task(map_index_template="Glue job{{ my_custom_template }}" , trigger_rule=TriggerRule.ALL_DONE)
+    def run_glue_dispatcher(payload , **context):
         row = payload['sensor_row']
         timestamp = payload['execution_time']
         row_count = row['TARGET_TABLE_ROW_COUNT']
         row_id = row['ID']
         source_table_name_2 = row['TARGET_TABLE_NAME']
+        extract_id = row['EXTRACT_ID']
         arg = f"{source_table_name_2}_{timestamp}"
+        context = get_current_context()
+        context["my_custom_template"] = f" trigger_for_{extract_id}"
 
         time.sleep(5) 
 
@@ -149,6 +168,7 @@ with DAG(
             print(f"Running Glue Job 1 for ID: {row_id}")
             # EmptyOperator(task_id="glue_job_1" )
             # Uncomment to actually run
+            context["my_custom_template"] = f" trigger_for_{extract_id} | Glue job name : S3-Merge-job-low-data "
             GlueJobOperator(
                 task_id=f"glue_job_1_{row_id}",
                 job_name="S3-Merge-job-low-data",
@@ -164,6 +184,7 @@ with DAG(
             print(f"Running Glue Job 2 for ID: {row_id}")
             # EmptyOpeßrator(task_id="glue_job_2" )
             # Uncomment to actually run
+            context["my_custom_template"] = f" trigger_for_{extract_id} | Glue job name : S3-Merge-job-2-HF "
             GlueJobOperator(
                 task_id=f"glue_job_2_{row_id}",
                 job_name="S3-Merge-job-2-HF",
@@ -185,7 +206,7 @@ with DAG(
 
     # Process data branch (only created if data exists)
     with TaskGroup("process_data_group") as process_data_group:
-        command_payloads = generate_copy_commands.expand(sensor_row=sensor_data)
+        command_payloads = generate_copy_commands.expand(sensor_row=sensor_data  )
         execution_results = execute_commands_unloading.expand(payload=command_payloads)
         glue_decision_branch = run_glue_dispatcher.expand(payload=execution_results)
 
