@@ -20,7 +20,14 @@ def get_current_ist_timestamp():
     utc_now = datetime.now(pytz.utc)
     ist_timezone = pytz.timezone('Asia/Kolkata')
     return utc_now.astimezone(ist_timezone).strftime("%Y_%m_%d_%H%M%S")
-    
+# def map_me(x, **context):
+#     print(x)
+
+#     from airflow.operators.python import get_current_context
+
+#     context = get_current_context()
+#     context["my_custom_template"] = f"{x}"
+
 with DAG(
     dag_id='Automated_with_glue_v2',
     schedule_interval="*/15 * * * *",
@@ -78,7 +85,6 @@ with DAG(
             # Ensure last_run is timezone-aware (set to IST)
             if last_run.tzinfo is None:
                 last_run = ist.localize(last_run)
-                print("ensure last run ")
 
             try:
                 # Calculate next_run (first run after last_run)
@@ -261,8 +267,8 @@ with DAG(
 
         return payload
 
-    @task(trigger_rule=TriggerRule.ALL_DONE , map_index_template="Update sensor logs for Id:{{ my_custom_template }}" )
-    def update_timestamps(payload , **context):
+    @task(trigger_rule=TriggerRule.ALL_DONE)
+    def update_timestamps(payload):
         """
         Update LAST_RUN_TIME to the computed last_run and NEXT_RUN_TIME to the next cron schedule.
         """
@@ -272,10 +278,7 @@ with DAG(
         last_run = row["last_run"]  # This is the computed next_run (now being marked as completed)
         next_run = row["next_run"]  # This is the future_run (next schedule)
         ist = pytz.timezone("Asia/Kolkata")
-        eid = row["EXTRACT_ID"]
         now_update = datetime.now(ist)  # Keep as timezone-aware datetime
-        context = get_current_context()
-        context["my_custom_template"] = f" trigger_for_{eid}"
 
         # Fetch current run history
         fetch_sql = f"""
@@ -285,7 +288,6 @@ with DAG(
         """
         result_df = hook.get_pandas_df(fetch_sql)
         current_history = result_df["RUN_HISTORY"].iloc[0]
-        print(current_history)
         extract_id = result_df["EXTRACT_ID"].iloc[0]
 
         # Load existing JSON or initialize empty dict
@@ -293,20 +295,12 @@ with DAG(
             history_dict = json.loads(current_history) if current_history else {}
         except Exception:
             history_dict = {}
-        
-        Dag_start_time = payload['execution_time']
-        # run_key = f"Run_At_{now_update.strftime('%Y%m%d_%H%M%S')}"
-        run_key = f"Run_At_{Dag_start_time}"
 
-        # Store the run data with the unique key
-        history_dict.setdefault("metadata_run_history", {})[run_key] = {
-            "extract_id": extract_id,
-            "last_run": last_run,
-            "Update_task_run_time": now_update.strftime("%Y-%m-%d %H:%M:%S")
-        }
+        # Append new entry
+        history_dict[last_run] = extract_id
 
         # Convert to JSON string
-        updated_history_json = json.dumps(history_dict , indent=4)
+        updated_history_json = json.dumps(history_dict)
 
         
         sql = f"""
@@ -320,6 +314,8 @@ with DAG(
             WHERE ID = '{id}'
         """
         hook.run(sql)
+
+    
 
     # Main workflow
     sensor_data = fetch_sensor_data()

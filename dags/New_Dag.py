@@ -6,6 +6,7 @@ from airflow.utils.dates import days_ago
 import pytz
 import logging
 from dateutil.parser import parse
+import json
 
 @dag(
     dag_id="sensor_table_cron_filtering",
@@ -84,13 +85,36 @@ def extract_dispatcher():
         last_run = row["last_run"]  # This is the computed next_run (now being marked as completed)
         next_run = row["next_run"]  # This is the future_run (next schedule)
 
+        # Fetch current run history
+        fetch_sql = f"""
+            SELECT RUN_HISTORY, EXTRACT_ID
+            FROM BCI_POC.EXTRACT_FRAMEWORK.SENSOR_TABLE
+            WHERE ID = '{id}'
+        """
+        result_df = hook.get_pandas_df(fetch_sql)
+        current_history = result_df["RUN_HISTORY"].iloc[0]
+        extract_id = result_df["EXTRACT_ID"].iloc[0]
+
+        # Load existing JSON or initialize empty dict
+        try:
+            history_dict = json.loads(current_history) if current_history else {}
+        except Exception:
+            history_dict = {}
+
+        # Append new entry
+        history_dict[last_run] = extract_id
+
+        # Convert to JSON string
+        updated_history_json = json.dumps(history_dict)
+
         
         sql = f"""
             UPDATE BCI_POC.EXTRACT_FRAMEWORK.SENSOR_TABLE
             SET 
                 LAST_RUN_TIME = TO_TIMESTAMP('{last_run}'),
                 NEXT_RUN_TIME = TO_TIMESTAMP('{next_run}'),
-                NUMBER_OF_RUN = ( select NUMBER_OF_RUN from BCI_POC.EXTRACT_FRAMEWORK.SENSOR_TABLE where ID = '{id}' ) +1
+                NUMBER_OF_RUN = ( select NUMBER_OF_RUN from BCI_POC.EXTRACT_FRAMEWORK.SENSOR_TABLE where ID = '{id}' ) +1 ,
+                RUN_HISTORY = PARSE_JSON('{updated_history_json}')
             WHERE ID = '{id}'
         """
         hook.run(sql)
