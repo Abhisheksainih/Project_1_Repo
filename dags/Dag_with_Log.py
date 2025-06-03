@@ -22,13 +22,106 @@ def get_current_ist_timestamp():
     utc_now = datetime.now(pytz.utc)
     ist_timezone = pytz.timezone('Asia/Kolkata')
     return utc_now.astimezone(ist_timezone).strftime("%Y_%m_%d_%H%M%S")
+
+def log_task_status_to_snowflake(context, status, error_message=None):
+    """Log task status to Snowflake mwaa_run_logs table"""
+    task_instance = context['task_instance']
+    dag_run = context['dag_run']
+    
+    # Get the task details
+    run_id = dag_run.run_id
+    dag_id = task_instance.dag_id
+    task_id = task_instance.task_id
+
+    ist = pytz.timezone('Asia/Kolkata')
+    start_time = task_instance.start_date.astimezone(ist) if task_instance.start_date else None
+    end_time = task_instance.end_date.astimezone(ist) if task_instance.end_date else None
+    duration = (task_instance.end_date - task_instance.start_date).total_seconds()
+    # Format timestamps
+    start_time_str = start_time.strftime("%Y-%m-%d %H:%M:%S") if start_time else "N/A"
+    end_time_str = end_time.strftime("%Y-%m-%d %H:%M:%S") if end_time else "N/A"
+    log_date = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
+
+
+    host_name = task_instance.hostname
+    log_date = datetime.now(pytz.timezone('Asia/Kolkata')).strftime("%Y-%m-%d %H:%M:%S")
+    
+    # For mapped tasks, get the original task ID and map index
+    if hasattr(task_instance, 'map_index') and task_instance.map_index >= 0:
+        task_id = f"{task_id}[{task_instance.map_index}]"
+    
+    # Get extract information from task instance (if available)
+    try:
+        task_info = str(task_instance.xcom_pull(task_ids=task_instance.task_id))
+    except:
+        task_info = 'NULL'
+    
+    # Get extract_name and schedule_id from the task's payload if available
+    extract_name = "NULL"
+    schedule_id = "NULL"
+    dag_start_time = "NULL"
+    last_run_time = "NULL"
+    
+    try:
+        if 'payload' in task_instance.xcom_pull(task_ids=task_instance.task_id):
+            payload = task_instance.xcom_pull(task_ids=task_instance.task_id)['payload']
+            if 'sensor_row' in payload:
+                sensor_row = payload['sensor_row']
+                extract_name = sensor_row.get('EXTRACT_ID', 'N/A')
+                schedule_id = sensor_row.get('ID', 'N/A')
+                dag_start_time = sensor_row.get('dag_start_time', 'N/A')
+                last_run_time = sensor_row.get('last_run', 'N/A')
+    except:
+        print("pass")
+        pass
+    
+    # Prepare the SQL query
+    safe_error_message = error_message.replace("'", "''") if error_message else None
+    safe_task_info = json.dumps(task_info).replace("'", "''") if task_info else "NULL"
+    sql = f"""
+        INSERT INTO BCI_POC.EXTRACT_FRAMEWORK.mwaa_run_logs (
+            run_id, dag_id, task_id, task_info, status, error_message,
+            Extract_Name, SCHEDULE_ID, Dag_Start_Time, Last_Run_Time,
+            duration_seconds, retry_count, host_name, task_start_time, task_end_time , Log_Insert_Date
+        ) VALUES (
+            '{run_id}', '{dag_id}', '{task_id}', {f"'{safe_task_info}'" if task_info else 'NULL'}, '{status}',
+            {f"'{safe_error_message}'" if error_message else 'NULL'},
+            '{extract_name}', '{schedule_id}', '{dag_start_time}', '{last_run_time}',
+            {duration}, {task_instance.try_number}, '{host_name}', '{start_time_str}', '{end_time_str}' , '{log_date}'
+        )
+    """
+    
+    # Execute the query
+    try:
+        hook = SnowflakeHook(snowflake_conn_id='snowflake_conn')
+        hook.run(sql)
+    except Exception as e:
+        logging.error(f"Failed to log task status to Snowflake: {str(e)}")
+
+def success_callback(context):
+    """Callback for successful task execution"""
+    logging.info("SUCCESS CALLBACK TRIGGERED")  # Check for this in logs
+    log_task_status_to_snowflake(context, 'SUCCESS')
+
+def failure_callback(context):
+    """Callback for failed task execution"""
+    error_message = str(context.get('exception') or "Unknown error")
+    log_task_status_to_snowflake(context, 'FAILED', error_message)
+
+default_args = {
+    'owner': 'airflow',
+    'on_success_callback': success_callback,
+    'on_failure_callback': failure_callback
+}
+
     
 with DAG(
-    dag_id='Automated_with_glue_v3',
-    schedule_interval="*/15 * * * *",
+    dag_id='Extraction_framework_dag_with_log_v3',
+    # schedule_interval="*/15 * * * *",
     start_date=datetime(2023, 1, 1),
-    # schedule_interval=None,
+    schedule_interval=None,
     catchup=False,
+    default_args=default_args, 
     tags=['snowflake', 'dynamic', 'unload'],
 ) as dag:
 
@@ -52,16 +145,30 @@ with DAG(
     #     """
     #     df = hook.get_pandas_df(sql)
     #     return df.to_dict(orient='records')   # Returns list of dicts or empty list
-    @task
+    # on_success_callback= success_callback, on_failure_callback= failure_callback
+    @task(on_success_callback= success_callback, on_failure_callback= failure_callback)
     def fetch_sensor_data():
         """
         Fetch rows from SENSOR_TABLE where CRON schedule indicates they're due to run now.
         """
         hook = SnowflakeHook(snowflake_conn_id='snowflake_conn')
+        # sensor_sql = """
+        #     SELECT ID, TARGET_TABLE_NAME, TARGET_TABLE_ROW_COUNT, S3_STAGE,
+        #         EXTRACT_ID, CRON, LAST_RUN_TIME , NUMBER_OF_RUN , LAST_UPDATE
+        #     FROM BCI_POC.EXTRACT_FRAMEWORK.SENSOR_TABLE
+        # """
         sensor_sql = """
-            SELECT ID, TARGET_TABLE_NAME, TARGET_TABLE_ROW_COUNT, S3_STAGE,
-                EXTRACT_ID, CRON, LAST_RUN_TIME , NUMBER_OF_RUN , LAST_UPDATE
-            FROM BCI_POC.EXTRACT_FRAMEWORK.SENSOR_TABLE
+        SELECT SCHEDULE_ID as ID, 
+        VIEW_NAME as TARGET_TABLE_NAME, 
+        ROW_COUNT as TARGET_TABLE_ROW_COUNT, null as S3_STAGE,
+        COALESCE(
+            NULLIF(f.value:"Overwrite Value":"2"::string, ''),
+            f.value:"Default Value":"2"::string
+            ) AS     EXTRACT_ID,  CRONJOB as CRON, LAST_RUN_TIME
+        FROM BCI_POC.EXTRACT_FRAMEWORK.EXTRACT_SCHEDULE e ,
+        LATERAL FLATTEN(input => e.state) f
+        WHERE f.key ILIKE '%param_table'
+        and IS_ACTIVE = TRUE
         """
         df = hook.get_pandas_df(sensor_sql)
         ist = pytz.timezone("Asia/Kolkata")
@@ -76,6 +183,9 @@ with DAG(
             # Parse last_run if it's a string
             if isinstance(last_run, str):
                 last_run = parse(last_run)
+            
+            if last_run is None:
+                last_run = datetime.now() 
             
             # Ensure last_run is timezone-aware (set to IST)
             if last_run.tzinfo is None:
@@ -180,21 +290,27 @@ with DAG(
             task_id=f"copy_header_{sensor_row['ID']}",
             sql=commands['header'],
             snowflake_conn_id='snowflake_conn',
-            dag=dag
+            dag=dag,
+            on_success_callback=success_callback,
+            on_failure_callback=failure_callback
         ).execute(context={})
         
         SnowflakeOperator(
             task_id=f"copy_main_{sensor_row['ID']}",
             sql=commands['main'],
             snowflake_conn_id='snowflake_conn',
-            dag=dag
+            dag=dag,
+            on_success_callback=success_callback,
+            on_failure_callback=failure_callback
         ).execute(context={})
         
         SnowflakeOperator(
             task_id=f"copy_footer_{sensor_row['ID']}",
             sql=commands['footer'],
             snowflake_conn_id='snowflake_conn',
-            dag=dag
+            dag=dag,
+            on_success_callback=success_callback,
+            on_failure_callback=failure_callback
         ).execute(context={})
         
         return payload  # Pass through the payload for downstream tasks
@@ -285,19 +401,36 @@ with DAG(
         context["my_custom_template"] = f" trigger_for_{eid}"
         
         Dag_time = row['dag_start_time']    
+        # sql = f"""
+        #     UPDATE BCI_POC.EXTRACT_FRAMEWORK.SENSOR_TABLE
+        #     SET 
+        #         LAST_RUN_TIME = TO_TIMESTAMP('{last_run}'),
+        #         NEXT_RUN_TIME = TO_TIMESTAMP('{next_run}'),
+        #         NUMBER_OF_RUN = ( select NUMBER_OF_RUN from BCI_POC.EXTRACT_FRAMEWORK.SENSOR_TABLE where ID = '{id}' ) +1 ,
+        #         LAST_UPDATE = '{now_update}'
+        #     WHERE ID = '{id}'
+        # """
         sql = f"""
-            UPDATE BCI_POC.EXTRACT_FRAMEWORK.SENSOR_TABLE
+            UPDATE BCI_POC.EXTRACT_FRAMEWORK.EXTRACT_SCHEDULE
             SET 
                 LAST_RUN_TIME = TO_TIMESTAMP('{last_run}'),
-                NEXT_RUN_TIME = TO_TIMESTAMP('{next_run}'),
-                NUMBER_OF_RUN = ( select NUMBER_OF_RUN from BCI_POC.EXTRACT_FRAMEWORK.SENSOR_TABLE where ID = '{id}' ) +1 ,
-                LAST_UPDATE = '{now_update}'
+                NEXT_RUN_TIME = TO_TIMESTAMP('{next_run}')
             WHERE ID = '{id}'
         """
         hook.run(sql)
         #####Update audit_log###########
-        sql_update_autid_log = f"""  insert into BCI_POC.EXTRACT_FRAMEWORK.Audit_Log(Extract_Id , Metadata_Id,
-        Dag_Start_Time , Last_Run_Time , Insert_Date ) 
+
+        # sql_update_autid_log = f"""  insert into BCI_POC.EXTRACT_FRAMEWORK.Audit_Log(Extract_Id , Metadata_Id,
+        # Dag_Start_Time , Last_Run_Time , Insert_Date ) 
+        # values(
+        # '{eid}' ,
+        # '{id}' ,
+        # '{Dag_time}',
+        # '{last_run}' ,
+        # '{now_update}'  ) """
+
+        sql_update_autid_log = f"""  insert into BCI_POC.EXTRACT_FRAMEWORK.mwaa_run_logs(Extract_Name , SCHEDULE_ID,
+        Dag_Start_Time , Last_Run_Time , Log_Insert_Date ) 
         values(
         '{eid}' ,
         '{id}' ,
@@ -311,7 +444,6 @@ with DAG(
     sensor_data = fetch_sensor_data()
     branch = check_data_status(sensor_data)
 
-
     # Process data branch (only created if data exists)
     with TaskGroup("process_data_group") as process_data_group:
         command_payloads = generate_copy_commands.expand(sensor_row=sensor_data  )
@@ -319,7 +451,6 @@ with DAG(
         glue_decision_branch = run_glue_dispatcher.expand(payload=execution_results)
         update = update_timestamps.partial(trigger_rule=TriggerRule.ALL_DONE).expand(payload=glue_decision_branch)
         
-
 
 
     # Set up dependencies
