@@ -16,6 +16,7 @@ from dateutil.parser import parse
 import json
 import random
 from airflow.utils.log.logging_mixin import LoggingMixin
+import re
 
 def get_current_ist_timestamp():
     """Returns current timestamp in IST timezone with YYYY_MM_DD_HHMMSS format"""
@@ -47,47 +48,76 @@ def log_task_status_to_snowflake(context, status, error_message=None):
     log_date = datetime.now(pytz.timezone('Asia/Kolkata')).strftime("%Y-%m-%d %H:%M:%S")
     
     # For mapped tasks, get the original task ID and map index
-    if hasattr(task_instance, 'map_index') and task_instance.map_index >= 0:
-        task_id = f"{task_id}[{task_instance.map_index}]"
+    mapped_template = None
     
-    # Get extract information from task instance (if available)
+    if hasattr(task_instance, 'map_index') and task_instance.map_index >= 0:
+        map_index = getattr(task_instance, 'map_index', None)
+        mapped_template = task_instance.xcom_pull( task_ids=task_instance.task_id ,key=f"mapped_template_name_{map_index}",map_indexes=map_index)
+        task_id = f"{task_id}[{task_instance.map_index}]-->[{mapped_template}]"
+
+    ###################
+ 
+    #Get extract information from task instance (if available)
     try:
         task_info = str(task_instance.xcom_pull(task_ids=task_instance.task_id))
     except:
-        task_info = 'NULL'
+        task_info = None
     
     # Get extract_name and schedule_id from the task's payload if available
-    extract_name = "NULL"
-    schedule_id = "NULL"
-    dag_start_time = "NULL"
-    last_run_time = "NULL"
-    
+    extract_name = None
+    schedule_id = None
+    dag_start_time = None
+    last_run_time = None
+    check = False
     try:
         if 'payload' in task_instance.xcom_pull(task_ids=task_instance.task_id):
             payload = task_instance.xcom_pull(task_ids=task_instance.task_id)['payload']
             if 'sensor_row' in payload:
                 sensor_row = payload['sensor_row']
-                extract_name = sensor_row.get('EXTRACT_ID', 'N/A')
-                schedule_id = sensor_row.get('ID', 'N/A')
-                dag_start_time = sensor_row.get('dag_start_time', 'N/A')
-                last_run_time = sensor_row.get('last_run', 'N/A')
+                extract_name = sensor_row.get('EXTRACT_ID', 'Null')
+                schedule_id = sensor_row.get('ID', 'Null')
+                dag_start_time = sensor_row.get('dag_start_time', 'Null')
+                last_run_time = sensor_row.get('last_run', 'Null')
+                extract_version = 'Null'
     except:
         print("pass")
         pass
     
     # Prepare the SQL query
     safe_error_message = error_message.replace("'", "''") if error_message else None
-    safe_task_info = json.dumps(task_info).replace("'", "''") if task_info else "NULL"
+    safe_task_info = json.dumps(task_info).replace("'", "''") if task_info else None
+    if mapped_template is None:
+        extract_version = None
+    
+    if mapped_template is not None:
+        if mapped_template and "Schedule_Id" in mapped_template:
+            schedule_id = re.search(r"Schedule_Id\s*:\s*(\d+)", mapped_template).group(1)
+        else:
+            schedule_id = None
+        if mapped_template and "Extract id" in mapped_template:
+            extract_name = re.search(r'Extract id\s*:\s*(\w+)', mapped_template).group(1)
+        else:
+            extract_name = None
+        if mapped_template and "View" in mapped_template:
+            extract_version = re.search(r'View\s*:\s*([^\s|]+)', mapped_template).group(1)
+            extract_version = extract_version.split('_')[-1]
+        else:
+            extract_version = None
+
     sql = f"""
         INSERT INTO BCI_POC.EXTRACT_FRAMEWORK.mwaa_run_logs (
             run_id, dag_id, task_id, task_info, status, error_message,
             Extract_Name, SCHEDULE_ID, Dag_Start_Time, Last_Run_Time,
-            duration_seconds, retry_count, host_name, task_start_time, task_end_time , Log_Insert_Date
+            duration_seconds, retry_count, host_name, task_start_time, task_end_time , Log_Insert_Date , EXTRACT_VERSION
         ) VALUES (
-            '{run_id}', '{dag_id}', '{task_id}', {f"'{safe_task_info}'" if task_info else 'NULL'}, '{status}',
-            {f"'{safe_error_message}'" if error_message else 'NULL'},
-            '{extract_name}', '{schedule_id}', '{dag_start_time}', '{last_run_time}',
-            {duration}, {task_instance.try_number}, '{host_name}', '{start_time_str}', '{end_time_str}' , '{log_date}'
+            '{run_id}', '{dag_id}', '{task_id}', {f"'{safe_task_info}'" if task_info else 'Null'}, '{status}',
+            {f"'{safe_error_message}'" if error_message else 'Null'},
+            { f"'{extract_name}'" if extract_name else 'Null' }, 
+            {f"'{schedule_id}'" if schedule_id else 'Null' },
+            {f"'{dag_start_time}'" if  dag_start_time else 'Null'}, 
+            {f"'{last_run_time}'" if last_run_time else 'Null'},
+            {duration}, {task_instance.try_number}, '{host_name}', '{start_time_str}', '{end_time_str}' , '{log_date}',
+            {f"'{extract_version}'" if extract_version  else 'Null'}
         )
     """
     
@@ -235,17 +265,25 @@ with DAG(
     
 
 
-    @task(map_index_template="Generating Copy command for {{my_custom_template}}")
+    @task(map_index_template="Generating Copy command for View : {{my_custom_template}}" , on_success_callback= success_callback, on_failure_callback= failure_callback)
     def generate_copy_commands(sensor_row , **context):
         timestamp = get_current_ist_timestamp()
         id_val = sensor_row['ID']
         source_table_name = sensor_row['TARGET_TABLE_NAME']
         temp_table_path = f"{source_table_name}_{timestamp}"
-        manifest_table = 'SENSOR_TABLE'
+        # manifest_table = 'SENSOR_TABLE'
+        manifest_table = 'BCI_POC.EXTRACT_FRAMEWORK.EXTRACT_SCHEDULE '
         context = get_current_context()
-        context["my_custom_template"] = f"{source_table_name} | Extract id : {sensor_row['EXTRACT_ID']}"
-
-
+        context["my_custom_template"] = f"{source_table_name} | Extract id : {sensor_row['EXTRACT_ID']} | Schedule_Id : {sensor_row['ID']} "
+        ##############
+        my_template = f"Generating Copy command for View : {source_table_name} | Extract id : {sensor_row['EXTRACT_ID'] } | Schedule_Id : {sensor_row['ID']}"
+        ti = context["ti"]
+        map_index = getattr(ti, "map_index", None)
+        if map_index is not None:
+            ti.xcom_push(key=f"mapped_template_name_{map_index}", value=my_template)
+        else:
+            ti.xcom_push(key="mapped_template_name_0", value=my_template)
+        ################
         
         s3_stage = "@my_s3_stage"
         s3_path = f"{s3_stage}/{temp_table_path}/data.gz"
@@ -256,7 +294,7 @@ with DAG(
             'commands': {
                 'header': f"""
                     COPY INTO {s3_path_h}
-                    FROM (SELECT header FROM {manifest_table} WHERE ID = '{id_val}')
+                    FROM (SELECT header FROM {manifest_table} WHERE SCHEDULE_ID = '{id_val}')
                     FILE_FORMAT = (TYPE = 'CSV' FIELD_DELIMITER = '|')
                     OVERWRITE = TRUE HEADER = FALSE;
                 """,
@@ -268,7 +306,7 @@ with DAG(
                 """,
                 'footer': f"""
                     COPY INTO {s3_path_f}
-                    FROM (SELECT footer FROM {manifest_table} WHERE ID = '{id_val}')
+                    FROM (SELECT footer FROM {manifest_table} WHERE SCHEDULE_ID = '{id_val}')
                     FILE_FORMAT = (TYPE = 'CSV' FIELD_DELIMITER = '|')
                     OVERWRITE = TRUE HEADER = FALSE;
                 """
@@ -277,7 +315,7 @@ with DAG(
             'execution_time': timestamp
         }
 
-    @task(map_index_template="Unloading of {{ my_custom_template }}")
+    @task(map_index_template="Unloading of View : {{ my_custom_template }}")
     def execute_commands_unloading(payload , **context):
         """Execute the generated SQL commands"""
         commands = payload['commands']
@@ -285,6 +323,16 @@ with DAG(
         source_table_name = sensor_row['TARGET_TABLE_NAME']
         context = get_current_context()
         context["my_custom_template"] = f" {source_table_name} | Extract id : {sensor_row['EXTRACT_ID']} "
+
+        #########################
+        my_template = f"Unloading of View : {source_table_name} | Extract id : {sensor_row['EXTRACT_ID'] } | Schedule_Id : {sensor_row['ID']}"
+        ti = context["ti"]
+        map_index = getattr(ti, "map_index", None)
+        if map_index is not None:
+            ti.xcom_push(key=f"mapped_template_name_{map_index}", value=my_template)
+        else:
+            ti.xcom_push(key="mapped_template_name_0", value=my_template)
+        ##########################
         
         SnowflakeOperator(
             task_id=f"copy_header_{sensor_row['ID']}",
@@ -341,6 +389,7 @@ with DAG(
         context = get_current_context()
         context["my_custom_template"] = f" trigger_for_{extract_id}"
 
+
         time.sleep(5) 
 
         if row_count <= 1000000:
@@ -348,6 +397,15 @@ with DAG(
             # EmptyOperator(task_id="glue_job_1" )
             # Uncomment to actually run
             context["my_custom_template"] = f" trigger_for_{extract_id} | Glue job name : S3-Merge-job-low-data "
+            ############
+            my_template = f"Glue job trigger for View : {source_table_name_2} | Extract id : {extract_id}|  Schedule_Id : {row_id} | Glue job name : S3-Merge-job-low-data "
+            ti = context["ti"]
+            map_index = getattr(ti, "map_index", None)
+            if map_index is not None:
+                ti.xcom_push(key=f"mapped_template_name_{map_index}", value=my_template)
+            else:
+                ti.xcom_push(key="mapped_template_name_0", value=my_template)
+            #######################
             GlueJobOperator(
                 task_id=f"glue_job_1_{row_id}",
                 job_name="S3-Merge-job-low-data",
@@ -364,6 +422,15 @@ with DAG(
             # EmptyOpeßrator(task_id="glue_job_2" )
             # Uncomment to actually run
             context["my_custom_template"] = f" trigger_for_{extract_id} | Glue job name : S3-Merge-job-2-HF "
+            ######
+            my_template = f"Glue job trigger for View : {source_table_name_2} | Extract id : {extract_id}|  Schedule_Id : {row_id} | Glue job name : S3-Merge-job-2-HF "
+            ti = context["ti"]
+            map_index = getattr(ti, "map_index", None)
+            if map_index is not None:
+                ti.xcom_push(key=f"mapped_template_name_{map_index}", value=my_template)
+            else:
+                ti.xcom_push(key="mapped_template_name_0", value=my_template)
+            #####################
             GlueJobOperator(
                 task_id=f"glue_job_2_{row_id}",
                 job_name="S3-Merge-job-2-HF",
@@ -415,7 +482,7 @@ with DAG(
             SET 
                 LAST_RUN_TIME = TO_TIMESTAMP('{last_run}'),
                 NEXT_RUN_TIME = TO_TIMESTAMP('{next_run}')
-            WHERE ID = '{id}'
+            WHERE SCHEDULE_ID = '{id}'
         """
         hook.run(sql)
         #####Update audit_log###########
@@ -429,7 +496,7 @@ with DAG(
         # '{last_run}' ,
         # '{now_update}'  ) """
 
-        sql_update_autid_log = f"""  insert into BCI_POC.EXTRACT_FRAMEWORK.mwaa_run_logs(Extract_Name , SCHEDULE_ID,
+        sql_update_autid_log = f"""  insert into BCI_POC.EXTRACT_FRAMEWORK.mwaa_audit_logs(Extract_Name , SCHEDULE_ID,
         Dag_Start_Time , Last_Run_Time , Log_Insert_Date ) 
         values(
         '{eid}' ,
