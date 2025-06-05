@@ -17,6 +17,9 @@ import json
 import random
 from airflow.utils.log.logging_mixin import LoggingMixin
 import re
+import os
+import tempfile
+
 
 def get_current_ist_timestamp():
     """Returns current timestamp in IST timezone with YYYY_MM_DD_HHMMSS format"""
@@ -56,6 +59,45 @@ def log_task_status_to_snowflake(context, status, error_message=None):
         task_id = f"{task_id}[{task_instance.map_index}]-->[{mapped_template}]"
 
     ###################
+    # Attempt to read the log file
+    # --- Fetch Airflow UI log via REST API ---
+    task_logs = ""
+    try:
+        # Construct the log file path dynamically based on the current task
+        # log_file_path = f"/usr/local/airflow/logs/dag_id={dag_id}/run_id={run_id}/task_id={task_instance.task_id}/attempt={task_instance.try_number}.log"
+        if hasattr(task_instance, 'map_index') and task_instance.map_index >= 0:
+            map_index = getattr(task_instance, 'map_index', None)
+            log_file_path = f"/usr/local/airflow/logs/dag_id={dag_id}/run_id={run_id}/task_id={task_instance.task_id}/map_index={map_index}/attempt={task_instance.try_number}.log"
+        else:
+            log_file_path = f"/usr/local/airflow/logs/dag_id={dag_id}/run_id={run_id}/task_id={task_instance.task_id}/attempt={task_instance.try_number}.log"
+
+
+        
+        with open(log_file_path, 'r') as file:
+            task_logs = file.read()
+            
+        # Truncate logs if they're too long for Snowflake (16MB string limit)
+        max_log_length = 32000  # Conservative limit for Snowflake
+        if len(task_logs) > max_log_length:
+            task_logs = task_logs[:max_log_length//2] + "\n...TRUNCATED...\n" + task_logs[-max_log_length//2:]
+    except FileNotFoundError:
+        task_logs = f"Log file not found at: {log_file_path}"
+    except Exception as e:
+        task_logs = f"Failed to read log file: {str(e)}"
+
+    if task_logs:
+        # First escape single quotes
+        task_logs = task_logs.replace("'", "''")
+    #     # Then escape any other problematic characters
+    #     safe_task_logs = safe_task_logs.replace('\\', '\\\\')
+    #     # Remove or replace any other special characters that might cause issues
+    #     safe_task_logs = ''.join(char for char in safe_task_logs if ord(char) >= 32 or char in '\n\r\t')
+    else:
+        task_logs = None
+    task_logs = f"""{task_logs}"""
+    # print(f" task is --> {task_logs}")
+    # print(safe_log_content)
+    ############################
  
     #Get extract information from task instance (if available)
     try:
@@ -106,9 +148,9 @@ def log_task_status_to_snowflake(context, status, error_message=None):
 
     sql = f"""
         INSERT INTO BCI_POC.EXTRACT_FRAMEWORK.mwaa_run_logs (
-            run_id, dag_id, task_id, task_info, status, error_message,
+            run_id, dag_id, task_id, TASK_RETRUN_INFO, status, error_message,
             Extract_Name, SCHEDULE_ID, Dag_Start_Time, Last_Run_Time,
-            duration_seconds, retry_count, host_name, task_start_time, task_end_time , Log_Insert_Date , EXTRACT_VERSION
+            duration_seconds, retry_count, host_name, task_start_time, task_end_time , Log_Insert_Date , EXTRACT_VERSION , LOG_INFO
         ) VALUES (
             '{run_id}', '{dag_id}', '{task_id}', {f"'{safe_task_info}'" if task_info else 'Null'}, '{status}',
             {f"'{safe_error_message}'" if error_message else 'Null'},
@@ -117,7 +159,8 @@ def log_task_status_to_snowflake(context, status, error_message=None):
             {f"'{dag_start_time}'" if  dag_start_time else 'Null'}, 
             {f"'{last_run_time}'" if last_run_time else 'Null'},
             {duration}, {task_instance.try_number}, '{host_name}', '{start_time_str}', '{end_time_str}' , '{log_date}',
-            {f"'{extract_version}'" if extract_version  else 'Null'}
+            {f"'{extract_version}'" if extract_version  else 'Null'} ,
+            {f"'{task_logs}'" if task_logs else 'Null'}
         )
     """
     
@@ -146,10 +189,10 @@ default_args = {
 
     
 with DAG(
-    dag_id='Extraction_framework_dag_with_log_v3',
-    # schedule_interval="*/15 * * * *",
+    dag_id='Extraction_framework_dag_with_log_v4',
+    schedule_interval="*/15 * * * *",
     start_date=datetime(2023, 1, 1),
-    schedule_interval=None,
+    # schedule_interval=None,
     catchup=False,
     default_args=default_args, 
     tags=['snowflake', 'dynamic', 'unload'],
@@ -198,7 +241,7 @@ with DAG(
         FROM BCI_POC.EXTRACT_FRAMEWORK.EXTRACT_SCHEDULE e ,
         LATERAL FLATTEN(input => e.state) f
         WHERE f.key ILIKE '%param_table'
-        and IS_ACTIVE = TRUE
+        and IS_ACTIVE = TRUE and CRONJOB is not null 
         """
         df = hook.get_pandas_df(sensor_sql)
         ist = pytz.timezone("Asia/Kolkata")
@@ -265,7 +308,7 @@ with DAG(
     
 
 
-    @task(map_index_template="Generating Copy command for View : {{my_custom_template}}" , on_success_callback= success_callback, on_failure_callback= failure_callback)
+    @task(map_index_template="Generating Copy command for View : {{my_custom_template}}" )
     def generate_copy_commands(sensor_row , **context):
         timestamp = get_current_ist_timestamp()
         id_val = sensor_row['ID']
@@ -275,7 +318,7 @@ with DAG(
         manifest_table = 'BCI_POC.EXTRACT_FRAMEWORK.EXTRACT_SCHEDULE '
         context = get_current_context()
         context["my_custom_template"] = f"{source_table_name} | Extract id : {sensor_row['EXTRACT_ID']} | Schedule_Id : {sensor_row['ID']} "
-        ##############
+        ####################
         my_template = f"Generating Copy command for View : {source_table_name} | Extract id : {sensor_row['EXTRACT_ID'] } | Schedule_Id : {sensor_row['ID']}"
         ti = context["ti"]
         map_index = getattr(ti, "map_index", None)
@@ -283,7 +326,7 @@ with DAG(
             ti.xcom_push(key=f"mapped_template_name_{map_index}", value=my_template)
         else:
             ti.xcom_push(key="mapped_template_name_0", value=my_template)
-        ################
+        ####################
         
         s3_stage = "@my_s3_stage"
         s3_path = f"{s3_stage}/{temp_table_path}/data.gz"
@@ -397,7 +440,7 @@ with DAG(
             # EmptyOperator(task_id="glue_job_1" )
             # Uncomment to actually run
             context["my_custom_template"] = f" trigger_for_{extract_id} | Glue job name : S3-Merge-job-low-data "
-            ############
+            #######################
             my_template = f"Glue job trigger for View : {source_table_name_2} | Extract id : {extract_id}|  Schedule_Id : {row_id} | Glue job name : S3-Merge-job-low-data "
             ti = context["ti"]
             map_index = getattr(ti, "map_index", None)
@@ -422,7 +465,7 @@ with DAG(
             # EmptyOpeßrator(task_id="glue_job_2" )
             # Uncomment to actually run
             context["my_custom_template"] = f" trigger_for_{extract_id} | Glue job name : S3-Merge-job-2-HF "
-            ######
+            #####################
             my_template = f"Glue job trigger for View : {source_table_name_2} | Extract id : {extract_id}|  Schedule_Id : {row_id} | Glue job name : S3-Merge-job-2-HF "
             ti = context["ti"]
             map_index = getattr(ti, "map_index", None)
@@ -447,8 +490,8 @@ with DAG(
 
         return payload
 
-    @task(trigger_rule=TriggerRule.ALL_DONE , map_index_template="Update sensor logs for Id:{{ my_custom_template }}" )
-    def update_timestamps(payload , **context):
+    @task(trigger_rule=TriggerRule.ALL_DONE , map_index_template="Update Last/Next run time for Id:{{ my_custom_template }}" )
+    def update_last_next_run(payload , **context):
         """
         Update LAST_RUN_TIME to the computed last_run and NEXT_RUN_TIME to the next cron schedule.
         """
@@ -461,22 +504,18 @@ with DAG(
         eid = row["EXTRACT_ID"]
         now_update = datetime.now(ist)  # Keep as timezone-aware datetime
         context = get_current_context()
-        try:
-            logging.info("Testttttttttttttttttttttt")
-        except Exception as e:
-            print(f"LOGGING FAILED: {e}")
         context["my_custom_template"] = f" trigger_for_{eid}"
+        #########################
+        my_template = f"Update Last/Next run time for View : {row['TARGET_TABLE_NAME']} | Extract id : {row['EXTRACT_ID'] } | Schedule_Id : {row['ID']}"
+        ti = context["ti"]
+        map_index = getattr(ti, "map_index", None)
+        if map_index is not None:
+            ti.xcom_push(key=f"mapped_template_name_{map_index}", value=my_template)
+        else:
+            ti.xcom_push(key="mapped_template_name_0", value=my_template)
+        ##########################
         
         Dag_time = row['dag_start_time']    
-        # sql = f"""
-        #     UPDATE BCI_POC.EXTRACT_FRAMEWORK.SENSOR_TABLE
-        #     SET 
-        #         LAST_RUN_TIME = TO_TIMESTAMP('{last_run}'),
-        #         NEXT_RUN_TIME = TO_TIMESTAMP('{next_run}'),
-        #         NUMBER_OF_RUN = ( select NUMBER_OF_RUN from BCI_POC.EXTRACT_FRAMEWORK.SENSOR_TABLE where ID = '{id}' ) +1 ,
-        #         LAST_UPDATE = '{now_update}'
-        #     WHERE ID = '{id}'
-        # """
         sql = f"""
             UPDATE BCI_POC.EXTRACT_FRAMEWORK.EXTRACT_SCHEDULE
             SET 
@@ -485,25 +524,17 @@ with DAG(
             WHERE SCHEDULE_ID = '{id}'
         """
         hook.run(sql)
-        #####Update audit_log###########
-
-        # sql_update_autid_log = f"""  insert into BCI_POC.EXTRACT_FRAMEWORK.Audit_Log(Extract_Id , Metadata_Id,
-        # Dag_Start_Time , Last_Run_Time , Insert_Date ) 
-        # values(
-        # '{eid}' ,
-        # '{id}' ,
-        # '{Dag_time}',
-        # '{last_run}' ,
-        # '{now_update}'  ) """
+        dag_run = context['dag_run']
+        run_id = dag_run.run_id
 
         sql_update_autid_log = f"""  insert into BCI_POC.EXTRACT_FRAMEWORK.mwaa_audit_logs(Extract_Name , SCHEDULE_ID,
-        Dag_Start_Time , Last_Run_Time , Log_Insert_Date ) 
+        Dag_Start_Time , Last_Run_Time , Log_Insert_Date , run_id  ) 
         values(
         '{eid}' ,
         '{id}' ,
         '{Dag_time}',
         '{last_run}' ,
-        '{now_update}'  ) """
+        '{now_update}' , '{run_id}'  ) """
 
         hook.run(sql_update_autid_log)
 
@@ -516,7 +547,7 @@ with DAG(
         command_payloads = generate_copy_commands.expand(sensor_row=sensor_data  )
         execution_results = execute_commands_unloading.expand(payload=command_payloads)
         glue_decision_branch = run_glue_dispatcher.expand(payload=execution_results)
-        update = update_timestamps.partial(trigger_rule=TriggerRule.ALL_DONE).expand(payload=glue_decision_branch)
+        update = update_last_next_run.partial(trigger_rule=TriggerRule.ALL_DONE).expand(payload=glue_decision_branch)
         
 
 
@@ -526,7 +557,6 @@ with DAG(
     branch >> process_data_group
 ######################################
 
-    
     # Both paths should trigger end
     [process_data_group, finish_empty] >>  end
 
