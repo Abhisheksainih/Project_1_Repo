@@ -7,7 +7,7 @@ from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
 from airflow.utils.trigger_rule import TriggerRule
 from airflow.utils.task_group import TaskGroup
 from airflow.operators.python import get_current_context
-from datetime import datetime
+from datetime import datetime , timedelta
 import time
 import pytz
 import logging
@@ -190,9 +190,9 @@ default_args = {
     
 with DAG(
     dag_id='Extraction_framework_dag_with_log_v4',
-    schedule_interval="*/15 * * * *",
+    # schedule_interval="*/15 * * * *",
     start_date=datetime(2023, 1, 1),
-    # schedule_interval=None,
+    schedule_interval=None,
     catchup=False,
     default_args=default_args, 
     tags=['snowflake', 'dynamic', 'unload'],
@@ -241,7 +241,7 @@ with DAG(
         FROM BCI_POC.EXTRACT_FRAMEWORK.EXTRACT_SCHEDULE e ,
         LATERAL FLATTEN(input => e.state) f
         WHERE f.key ILIKE '%param_table'
-        and IS_ACTIVE = TRUE and CRONJOB is not null 
+        and IS_ACTIVE = TRUE and CRONJOB is not null and  CRONJOB <> ''
         """
         df = hook.get_pandas_df(sensor_sql)
         ist = pytz.timezone("Asia/Kolkata")
@@ -258,7 +258,11 @@ with DAG(
                 last_run = parse(last_run)
             
             if last_run is None:
-                last_run = datetime.now() 
+                # last_run = datetime.now()
+                last_run = datetime.now(ist) 
+                cron = croniter(cron_expr, last_run)
+                last_run = cron.get_prev(datetime)
+                last_run = cron.get_prev(datetime)
             
             # Ensure last_run is timezone-aware (set to IST)
             if last_run.tzinfo is None:
