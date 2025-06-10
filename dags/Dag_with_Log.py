@@ -525,7 +525,7 @@ with DAG(
             SET 
                 LAST_RUN_TIME = TO_TIMESTAMP('{last_run}'),
                 NEXT_RUN_TIME = TO_TIMESTAMP('{next_run}')
-            WHERE SCHEDULE_ID = '{id}'
+            WHERE SCHEDULE_ID = '{id}' and IS_ACTIVE = TRUE
         """
         hook.run(sql)
         dag_run = context['dag_run']
